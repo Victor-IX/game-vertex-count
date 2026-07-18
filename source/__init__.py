@@ -1,9 +1,12 @@
+import time
+
 import bmesh
 import bpy
 from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, IntProperty
 
 _vertex_count_cache = {}
+_selected_vertex_count_cache = {}
 
 
 def calculate_game_vertex_count(mesh, precision=5, selected_only=False):
@@ -31,7 +34,6 @@ def calculate_game_vertex_count(mesh, precision=5, selected_only=False):
         normal = corner_normals[loop.index].vector
         normal_key = (
             round(normal.x, precision),
-            round(normal.y, precision),
             round(normal.z, precision),
         )
 
@@ -68,11 +70,13 @@ def get_object_vertex_counts(context, obj, use_modifiers=True):
     prefs = get_preferences(context)
     precision = prefs.precision if prefs else 5
 
+    start_time = time.perf_counter()
     real_count, normal_added, uv_added = calculate_game_vertex_count(mesh, precision)
+    elapsed_time = time.perf_counter() - start_time
     blender_count = len(mesh.vertices)
 
-    _vertex_count_cache[obj.name] = (real_count, blender_count, normal_added, uv_added)
-    return real_count, blender_count, normal_added, uv_added
+    _vertex_count_cache[obj.name] = (real_count, blender_count, normal_added, uv_added, elapsed_time)
+    return real_count, blender_count, normal_added, uv_added, elapsed_time
 
 
 def get_preferences(context):
@@ -84,49 +88,101 @@ def is_countable_mesh_object(obj):
     return obj is not None and obj.type == "MESH" and obj.data is not None
 
 
+def get_target_objects(context):
+    active = context.active_object
+    if active is not None and active.mode == "EDIT":
+        objs = context.objects_in_mode_unique_data
+    else:
+        objs = context.selected_objects
+        if not objs and active is not None:
+            objs = [active]
+    return [o for o in objs if is_countable_mesh_object(o)]
+
+
+def get_selection_signature(bm):
+    return (len(bm.verts), tuple(v.index for v in bm.verts if v.select))
+
+
 def get_selected_vertex_counts(context, obj):
     prefs = get_preferences(context)
     precision = prefs.precision if prefs else 5
 
     bm = bmesh.from_edit_mesh(obj.data)
-    blender_count = sum(1 for v in bm.verts if v.select)
+    signature = get_selection_signature(bm)
+
+    cached = _selected_vertex_count_cache.get(obj.name)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+
+    blender_count = len(signature[1])
 
     temp_mesh = bpy.data.meshes.new("GameVertexCount_temp")
     try:
         bm.to_mesh(temp_mesh)
-        real_count, normal_added, uv_added = calculate_game_vertex_count(
-            temp_mesh, precision, selected_only=True
-        )
+        start_time = time.perf_counter()
+        real_count, normal_added, uv_added = calculate_game_vertex_count(temp_mesh, precision, selected_only=True)
+        elapsed_time = time.perf_counter() - start_time
     finally:
         bpy.data.meshes.remove(temp_mesh)
 
-    return real_count, blender_count, normal_added, uv_added
+    result = (real_count, blender_count, normal_added, uv_added, elapsed_time)
+    _selected_vertex_count_cache[obj.name] = (signature, result)
+    return result
 
 
-def draw_vertex_count_stats(layout, context, obj):
-    if obj.mode == "EDIT":
-        sel_real_count, sel_blender_count, sel_normal_added, sel_uv_added = get_selected_vertex_counts(
-            context, obj
-        )
+def draw_vertex_count_stats(layout, context, objs):
+    prefs = get_preferences(context)
+    enable_profiling = prefs.enable_profiling if prefs else False
+    active = context.active_object
+    multiple = len(objs) > 1
+
+    if active is not None and active.mode == "EDIT":
+        sel_real_count = sel_blender_count = sel_normal_added = sel_uv_added = 0
+        sel_elapsed_time = 0.0
+        for obj in objs:
+            real_count, blender_count, normal_added, uv_added, elapsed_time = get_selected_vertex_counts(
+                context, obj
+            )
+            sel_real_count += real_count
+            sel_blender_count += blender_count
+            sel_normal_added += normal_added
+            sel_uv_added += uv_added
+            sel_elapsed_time += elapsed_time
+
         sel_col = layout.column(align=True)
+        if multiple:
+            sel_col.label(text=f"Selected Objects: {len(objs)}")
         sel_col.label(text=f"Selected Vertices: {sel_blender_count:,}")
         sel_col.label(text=f"UV Vertices: {sel_uv_added:,}")
         sel_col.label(text=f"Normal Vertices: {sel_normal_added:,}")
         sel_col.label(text=f"Selected Game Vertices: {sel_real_count:,}")
+        if enable_profiling:
+            sel_col.label(text=f"Calculation Time: {sel_elapsed_time * 1000:.2f} ms")
         return
 
-    prefs = get_preferences(context)
     use_modifiers = prefs.use_modifiers if prefs else True
-    counts = _vertex_count_cache.get(obj.name)
-    if counts is None:
-        counts = get_object_vertex_counts(context, obj, use_modifiers)
-    real_count, blender_count, normal_added, uv_added = counts
+    real_count = blender_count = normal_added = uv_added = 0
+    elapsed_time = 0.0
+    for obj in objs:
+        counts = _vertex_count_cache.get(obj.name)
+        if counts is None:
+            counts = get_object_vertex_counts(context, obj, use_modifiers)
+        obj_real_count, obj_blender_count, obj_normal_added, obj_uv_added, obj_elapsed_time = counts
+        real_count += obj_real_count
+        blender_count += obj_blender_count
+        normal_added += obj_normal_added
+        uv_added += obj_uv_added
+        elapsed_time += obj_elapsed_time
 
     col = layout.column(align=True)
+    if multiple:
+        col.label(text=f"Selected Objects: {len(objs)}")
     col.label(text=f"Vertices: {blender_count:,}")
     col.label(text=f"UV Vertices: {uv_added:,}")
     col.label(text=f"Normal Vertices: {normal_added:,}")
     col.label(text=f"Game Vertices: {real_count:,}")
+    if enable_profiling:
+        col.label(text=f"Calculation Time: {elapsed_time * 1000:.2f} ms")
 
 
 class VIEW3D_PT_game_vertex_count(bpy.types.Panel):
@@ -137,10 +193,10 @@ class VIEW3D_PT_game_vertex_count(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return is_countable_mesh_object(context.active_object)
+        return bool(get_target_objects(context))
 
     def draw(self, context):
-        draw_vertex_count_stats(self.layout, context, context.active_object)
+        draw_vertex_count_stats(self.layout, context, get_target_objects(context))
 
 
 class GameVertexCountPreferences(bpy.types.AddonPreferences):
@@ -158,25 +214,33 @@ class GameVertexCountPreferences(bpy.types.AddonPreferences):
         min=1,
         max=8,
     )
+    enable_profiling: BoolProperty(
+        name="Enable Profiling",
+        description="Display how long the vertex count calculation took, to help profile the add-on's performance impact",
+        default=False,
+    )
 
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "use_modifiers")
         layout.prop(self, "precision")
+        layout.prop(self, "enable_profiling")
 
 
 @persistent
 def on_depsgraph_update(scene, depsgraph):
     context = bpy.context
-    obj = context.active_object
-    if not is_countable_mesh_object(obj):
+    objs = get_target_objects(context)
+    if not objs:
         return
 
+    watched_names = {o.name for o in objs} | {o.data.name for o in objs}
     for update in depsgraph.updates:
-        if update.id.name == obj.name or update.id.name == obj.data.name:
+        if update.id.name in watched_names:
             prefs = get_preferences(context)
             use_modifiers = prefs.use_modifiers if prefs else True
-            get_object_vertex_counts(context, obj, use_modifiers)
+            for obj in objs:
+                get_object_vertex_counts(context, obj, use_modifiers)
             for area in context.screen.areas:
                 if area.type in {"VIEW_3D", "PROPERTIES"}:
                     area.tag_redraw()
@@ -186,6 +250,7 @@ def on_depsgraph_update(scene, depsgraph):
 @persistent
 def on_load_post(_dummy):
     _vertex_count_cache.clear()
+    _selected_vertex_count_cache.clear()
 
 
 classes = (
@@ -212,6 +277,7 @@ def unregister():
         bpy.utils.unregister_class(cls)
 
     _vertex_count_cache.clear()
+    _selected_vertex_count_cache.clear()
 
 
 if __name__ == "__main__":
