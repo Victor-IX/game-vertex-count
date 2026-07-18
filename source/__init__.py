@@ -9,30 +9,48 @@ _vertex_count_cache = {}
 def calculate_game_vertex_count(mesh, precision=5, selected_only=False):
     if not mesh.polygons:
         if selected_only:
-            return sum(1 for v in mesh.vertices if v.select)
-        return len(mesh.vertices)
+            count = sum(1 for v in mesh.vertices if v.select)
+        else:
+            count = len(mesh.vertices)
+        return count, 0, 0
 
     corner_normals = mesh.corner_normals
     uv_layers = mesh.uv_layers
 
     unique_corners = set()
+    unique_normal_corners = set()
+    unique_uv_corners = set()
+    unique_vertices = set()
+
     for loop in mesh.loops:
-        if selected_only and not mesh.vertices[loop.vertex_index].select:
+        vertex_index = loop.vertex_index
+        if selected_only and not mesh.vertices[vertex_index].select:
             continue
+        unique_vertices.add(vertex_index)
+
         normal = corner_normals[loop.index].vector
-        key = [
-            loop.vertex_index,
+        normal_key = (
             round(normal.x, precision),
             round(normal.y, precision),
             round(normal.z, precision),
-        ]
+        )
+
+        uv_key = []
         for uv_layer in uv_layers:
             uv = uv_layer.data[loop.index].uv
-            key.append(round(uv.x, precision))
-            key.append(round(uv.y, precision))
-        unique_corners.add(tuple(key))
+            uv_key.append(round(uv.x, precision))
+            uv_key.append(round(uv.y, precision))
+        uv_key = tuple(uv_key)
 
-    return len(unique_corners)
+        unique_corners.add((vertex_index, normal_key, uv_key))
+        unique_normal_corners.add((vertex_index, normal_key))
+        unique_uv_corners.add((vertex_index, uv_key))
+
+    base_count = len(unique_vertices)
+    normal_added = len(unique_normal_corners) - base_count
+    uv_added = len(unique_uv_corners) - base_count
+
+    return len(unique_corners), normal_added, uv_added
 
 
 def get_evaluated_mesh(context, obj):
@@ -50,11 +68,11 @@ def get_object_vertex_counts(context, obj, use_modifiers=True):
     prefs = get_preferences(context)
     precision = prefs.precision if prefs else 5
 
-    real_count = calculate_game_vertex_count(mesh, precision)
+    real_count, normal_added, uv_added = calculate_game_vertex_count(mesh, precision)
     blender_count = len(mesh.vertices)
 
-    _vertex_count_cache[obj.name] = (real_count, blender_count)
-    return real_count, blender_count
+    _vertex_count_cache[obj.name] = (real_count, blender_count, normal_added, uv_added)
+    return real_count, blender_count, normal_added, uv_added
 
 
 def get_preferences(context):
@@ -76,18 +94,24 @@ def get_selected_vertex_counts(context, obj):
     temp_mesh = bpy.data.meshes.new("GameVertexCount_temp")
     try:
         bm.to_mesh(temp_mesh)
-        real_count = calculate_game_vertex_count(temp_mesh, precision, selected_only=True)
+        real_count, normal_added, uv_added = calculate_game_vertex_count(
+            temp_mesh, precision, selected_only=True
+        )
     finally:
         bpy.data.meshes.remove(temp_mesh)
 
-    return real_count, blender_count
+    return real_count, blender_count, normal_added, uv_added
 
 
 def draw_vertex_count_stats(layout, context, obj):
     if obj.mode == "EDIT":
-        sel_real_count, sel_blender_count = get_selected_vertex_counts(context, obj)
+        sel_real_count, sel_blender_count, sel_normal_added, sel_uv_added = get_selected_vertex_counts(
+            context, obj
+        )
         sel_col = layout.column(align=True)
         sel_col.label(text=f"Selected Vertices: {sel_blender_count:,}")
+        sel_col.label(text=f"UV Vertices: {sel_uv_added:,}")
+        sel_col.label(text=f"Normal Vertices: {sel_normal_added:,}")
         sel_col.label(text=f"Selected Game Vertices: {sel_real_count:,}")
         return
 
@@ -96,10 +120,12 @@ def draw_vertex_count_stats(layout, context, obj):
     counts = _vertex_count_cache.get(obj.name)
     if counts is None:
         counts = get_object_vertex_counts(context, obj, use_modifiers)
-    real_count, blender_count = counts
+    real_count, blender_count, normal_added, uv_added = counts
 
     col = layout.column(align=True)
     col.label(text=f"Vertices: {blender_count:,}")
+    col.label(text=f"UV Vertices: {uv_added:,}")
+    col.label(text=f"Normal Vertices: {normal_added:,}")
     col.label(text=f"Game Vertices: {real_count:,}")
 
 
@@ -107,20 +133,6 @@ class VIEW3D_PT_game_vertex_count(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "Item"
-    bl_label = "Game Vertex Count"
-
-    @classmethod
-    def poll(cls, context):
-        return is_countable_mesh_object(context.active_object)
-
-    def draw(self, context):
-        draw_vertex_count_stats(self.layout, context, context.active_object)
-
-
-class DATA_PT_game_vertex_count(bpy.types.Panel):
-    bl_space_type = "PROPERTIES"
-    bl_region_type = "WINDOW"
-    bl_context = "data"
     bl_label = "Game Vertex Count"
 
     @classmethod
@@ -178,7 +190,6 @@ def on_load_post(_dummy):
 
 classes = (
     VIEW3D_PT_game_vertex_count,
-    DATA_PT_game_vertex_count,
     GameVertexCountPreferences,
 )
 
